@@ -1,0 +1,47 @@
+name: EMS IoT Data Pipeline
+
+on:
+  schedule:
+    - cron: "*/5 * * * *" # Runs every 5 minutes (subject to GitHub delays)
+  workflow_dispatch: # Allows manual execution from the Actions tab
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run Silver Layer (Cleaning & Validation)
+        env:
+          INFLUX_HOST: ${{ secrets.INFLUX_HOST }}
+          INFLUX_TOKEN: ${{ secrets.INFLUX_TOKEN }}
+          INFLUX_ORG: ${{ secrets.INFLUX_ORG }}
+          INFLUX_DATABASE: ${{ secrets.INFLUX_DATABASE }}
+        run: python src/silver_layer.py
+
+      - name: Run Gold Aggregator (Hourly Aggregation)
+        env:
+          INFLUX_HOST: ${{ secrets.INFLUX_HOST }}
+          INFLUX_TOKEN: ${{ secrets.INFLUX_TOKEN }}
+          INFLUX_ORG: ${{ secrets.INFLUX_ORG }}
+          INFLUX_DATABASE: ${{ secrets.INFLUX_DATABASE }}
+        run: python src/gold_aggregator.py
+
+      - name: Run Gold Battery Simulator (ROI Simulation)
+        env:
+          INFLUX_HOST: ${{ secrets.INFLUX_HOST }}
+          INFLUX_TOKEN: ${{ secrets.INFLUX_TOKEN }}
+          INFLUX_ORG: ${{ secrets.INFLUX_ORG }}
+          INFLUX_DATABASE: ${{ secrets.INFLUX_DATABASE }}
+        run: python src/gold_battery_sim.py

@@ -1,0 +1,42 @@
+name: EMS Daily Archive
+
+on:
+  schedule:
+    - cron: "5 0 * * *" # 00:05 UTC daily — runs after the last 5-min ETL of the previous day
+    # DOES NOT Allow manual execution
+
+permissions:
+  contents: write # Required for committing and pushing the CSV report
+
+jobs:
+  daily-archive:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run Daily Archive (aggregate previous day → CSV)
+        env:
+          INFLUX_HOST: ${{ secrets.INFLUX_HOST }}
+          INFLUX_TOKEN: ${{ secrets.INFLUX_TOKEN }}
+          INFLUX_ORG: ${{ secrets.INFLUX_ORG }}
+          INFLUX_DATABASE: ${{ secrets.INFLUX_DATABASE }}
+        run: python src/gold_daily_archive.py
+
+      - name: Commit and push daily report
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/daily_ems_report.csv
+          git diff --cached --quiet || git commit -m "chore: daily EMS report $(date -u +%Y-%m-%d) [skip ci]"
+          git push
