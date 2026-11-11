@@ -38,10 +38,18 @@ jobs:
           INFLUX_DATABASE: ${{ secrets.INFLUX_DATABASE }}
         run: python src/gold_aggregator.py
 
-      - name: Run Gold Battery Simulator (ROI Simulation)
+      - name: Run Bronze RCE Prices (PSE export energy price)
         env:
           INFLUX_HOST: ${{ secrets.INFLUX_HOST }}
           INFLUX_TOKEN: ${{ secrets.INFLUX_TOKEN }}
           INFLUX_ORG: ${{ secrets.INFLUX_ORG }}
           INFLUX_DATABASE: ${{ secrets.INFLUX_DATABASE }}
-        run: python src/gold_battery_sim.py
+        run: python src/bronze_price_rce.py
+
+      - name: Run Gold Energy Savings (PV + Battery Savings)
+        env:
+          INFLUX_HOST: ${{ secrets.INFLUX_HOST }}
+          INFLUX_TOKEN: ${{ secrets.INFLUX_TOKEN }}
+          INFLUX_ORG: ${{ secrets.INFLUX_ORG }}
+          INFLUX_DATABASE: ${{ secrets.INFLUX_DATABASE }}
+        run: python src/gold_energy_savings.py
