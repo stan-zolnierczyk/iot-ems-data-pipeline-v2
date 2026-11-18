@@ -51,15 +51,16 @@ EXPORT = ('DTSU666', 'export')
 CONSUMPTION = ('EMS_Calculated', 'consumption')
 
 
-def fetch_silver(client, table, start):
+def fetch_silver(client, table, start, end=None):
     """
-    Fetches a Silver table since start, pivoted to one column per (device, measurement_type).
-    Returns an empty DataFrame if the table does not exist yet.
+    Fetches a table for start <= time < end (default: up to now()), pivoted to one column
+    per (device, measurement_type). Returns an empty DataFrame if the table does not exist yet.
     """
+    upper = f"time < '{end.strftime('%Y-%m-%dT%H:%M:%SZ')}'" if end is not None else 'time <= now()'
     query = f'''
     SELECT time, device, measurement_type, value
     FROM {table}
-    WHERE time >= '{start.strftime('%Y-%m-%dT%H:%M:%SZ')}' AND time <= now()
+    WHERE time >= '{start.strftime('%Y-%m-%dT%H:%M:%SZ')}' AND {upper}
     '''
     try:
         df = client.query(query, mode='pandas')

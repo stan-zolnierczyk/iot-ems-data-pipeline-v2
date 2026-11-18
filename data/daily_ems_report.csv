@@ -1,1 +1,1 @@
-date,production_kwh,import_kwh,export_kwh,consumption_kwh,import_simulated_kwh,export_simulated_kwh,daily_savings_pln
+date,production_kwh,import_kwh,export_kwh,consumption_kwh,battery_charge_kwh,battery_discharge_kwh,daily_savings_pln,daily_irradiation

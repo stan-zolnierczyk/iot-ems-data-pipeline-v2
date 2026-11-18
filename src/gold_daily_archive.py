@@ -1,125 +1,136 @@
 """
 Gold Layer ETL — daily CSV archive of EMS metrics.
 
-Aggregates the previous complete day (00:00:00 -> 23:59:59 UTC) from
-the Gold layer in InfluxDB into a single row appended to
-data/daily_ems_report.csv in the GitHub repository. Provides a long-term,
+Aggregates the previous complete local day (00:00 -> 24:00 Europe/Warsaw, the same day
+boundary as the device energy counters; 23 or 25 hours on DST change days) into a single
+row appended to data/daily_ems_report.csv in the GitHub repository. Provides a long-term,
 git-tracked record with infinite retention.
 
-Columns:    date, production_kwh, import_kwh, export_kwh, consumption_kwh,
-            import_simulated_kwh, export_simulated_kwh, daily_savings_pln.
+Columns:
+  - date:                   local calendar day (YYYY-MM-DD).
+  - production_kwh, import_kwh, export_kwh, consumption_kwh,
+    battery_charge_kwh, battery_discharge_kwh:
+                            sum of hourly energy from energy_hourly (Wh -> kWh).
+  - daily_savings_pln:      sum of hourly selfConsumptionSavings and exportRevenue from
+                            savings_hourly. Hours without an RCE price contribute no export
+                            revenue; a warning is printed.
+  - daily_irradiation:      integral of the ELSNER irradiation reading (Bronze table
+                            irradiation) over the day: sum of 1-minute values, in the sensor's
+                            own units (value x minutes, no unit conversion). Readings outside
+                            0..IRRADIATION_MAX and missing minutes are linearly interpolated.
 
-Source-aware aggregation: 
-SUM of hourly deltas for energy_hourly metrics, 
-MAX for daily-cumulative counters in battery_simulation.
-Idempotent — re-running on the same day will not produce duplicate rows.
+Idempotent — re-running for the same day does not produce duplicate rows.
 
-Scheduled to run once per day shortly after midnight UTC via GitHub
-Actions, which then commits and pushes the updated CSV.
+Scheduled to run once per day shortly after midnight UTC via GitHub Actions
+(after the local day has ended), which then commits and pushes the updated CSV.
 """
 
 import sys
 import os
 import pandas as pd
-from datetime import datetime, timezone, timedelta
-from influxdb_client import InfluxDBClient
+from influxdb_client_3 import InfluxDBClient3
 
 # Ensure the script can import local modules in CI/CD environments
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from config import INFLUX_URL, INFLUX_TOKEN, INFLUX_ORG, INFLUX_BUCKET
+from config import INFLUX_HOST, INFLUX_TOKEN, INFLUX_DATABASE, INFLUX_ORG
+from gold_aggregator import fetch_silver
 
 CSV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'data', 'daily_ems_report.csv')
+LOCAL_TZ = 'Europe/Warsaw'
+
+# CSV column -> energy_hourly measurement_type (Wh)
+ENERGY_COLUMNS = {
+    'production_kwh': 'production',
+    'import_kwh': 'import',
+    'export_kwh': 'export',
+    'consumption_kwh': 'consumption',
+    'battery_charge_kwh': 'currentDayCharge',
+    'battery_discharge_kwh': 'currentDayDischarge',
+}
+SAVINGS_COMPONENTS = ['selfConsumptionSavings', 'exportRevenue']
+
+IRRADIATION = ('ELSNER', 'irradiation')
+IRRADIATION_MAX = 500
+# Readings fetched around the day, so interpolation across midnight has neighbours
+IRRADIATION_CONTEXT = pd.Timedelta(hours=1)
+
+CSV_COLUMNS = ['date', *ENERGY_COLUMNS, 'daily_savings_pln', 'daily_irradiation']
+
+
+def daily_energy(energy_hourly):
+    """Daily totals [kWh] per CSV column; None if a series has no data."""
+    sums = energy_hourly.droplevel('device', axis=1).sum(min_count=1)
+    return {col: round(sums[mt] / 1000, 3) if pd.notna(sums.get(mt)) else None
+            for col, mt in ENERGY_COLUMNS.items()}
+
+
+def daily_savings(savings_hourly):
+    """Daily savings [PLN] from the hourly components; None if there is no data."""
+    if savings_hourly.empty:
+        return None
+    components = savings_hourly.droplevel('device', axis=1).reindex(columns=SAVINGS_COMPONENTS)
+    missing = int(components['exportRevenue'].isna().sum())
+    if missing:
+        print(f"WARNING: {missing} hours without exportRevenue (no RCE price); "
+              f"daily_savings_pln includes self-consumption only for these hours.")
+    total = components.sum().sum(min_count=1)
+    return round(total, 2) if pd.notna(total) else None
+
+
+def daily_irradiation(irradiation, day_start, day_end):
+    """Integral of irradiation over [day_start, day_end): sum of linearly interpolated 1-minute values."""
+    if irradiation.empty or IRRADIATION not in irradiation.columns:
+        return None
+    s = irradiation[IRRADIATION]
+    s = s.where((s >= 0) & (s <= IRRADIATION_MAX))
+    s = s.groupby(s.index.floor('1min')).last()
+    grid = pd.date_range(day_start, day_end, freq='1min', inclusive='left')
+    s = s.reindex(s.index.union(grid)).interpolate(method='time', limit_area='inside').reindex(grid)
+    missing = int(s.isna().sum())
+    if missing == len(grid):
+        return None
+    if missing:
+        print(f"WARNING: {missing} minutes of irradiation outside the available readings (counted as 0).")
+    return int(round(s.sum()))
+
 
 def process_daily_archive():
-    """
-    Gold Layer ETL: Aggregates previous day's data into a daily CSV report.
-    Appends one row per day to data/daily_ems_report.csv in the repository.
-    Designed to run once per day at 00:05 UTC via GitHub Actions.
+    """Aggregates the previous local day into one row of data/daily_ems_report.csv."""
+    today_local = pd.Timestamp.now(tz=LOCAL_TZ).normalize()
+    day_start_local = (today_local - pd.Timedelta(days=1)).normalize()
+    date_label = day_start_local.strftime('%Y-%m-%d')
+    day_start = day_start_local.tz_convert('UTC')
+    day_end = today_local.tz_convert('UTC')
+    print(f"Processing daily archive for {date_label} ({day_start} -> {day_end})")
 
-    Sources:
-      - energy_hourly: production, import, export, consumption — summed to daily totals (kWh)
-      - battery_simulation: import_simulated, export_simulated — last value of day (cumulative day counter → kWh)
-                            daily_savings_pln — last value of day (cumulative day savings → PLN)
-    """
-    client = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG)
-    query_api = client.query_api()
+    if os.path.exists(CSV_PATH) and date_label in pd.read_csv(CSV_PATH, dtype={'date': str})['date'].values:
+        print(f"Entry for {date_label} already exists. Skipping.")
+        return
 
-    # Define previous complete day boundaries (UTC): yesterday 00:00:00 → 23:59:59
-    today_utc = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-    yesterday_start = today_utc - timedelta(days=1)
-    yesterday_end = yesterday_start.replace(hour=23, minute=59, second=59)
-    date_label = yesterday_start.strftime('%Y-%m-%d')
-    start = yesterday_start.strftime('%Y-%m-%dT%H:%M:%SZ')
-    stop = yesterday_end.strftime('%Y-%m-%dT%H:%M:%SZ')
-
-    print(f"Processing daily archive for {date_label} ({start} -> {stop})")
-
-    # --- ENERGY HOURLY: 
-    energy_query = f'''
-from(bucket: "{INFLUX_BUCKET}")
-    |> range(start: {start}, stop: {stop})
-    |> filter(fn: (r) => r._measurement == "energy_hourly")
-    |> filter(fn: (r) => r._field == "value")
-'''
-
-    # --- BATTERY SIMULATION: 
-    battery_query = f'''
-from(bucket: "{INFLUX_BUCKET}")
-    |> range(start: {start}, stop: {stop})
-    |> filter(fn: (r) => r._measurement == "battery_simulation")
-    |> filter(fn: (r) => r._field == "value")
-    |> filter(fn: (r) => r.measurement_type == "import_simulated" or r.measurement_type == "export_simulated" or r.measurement_type == "daily_savings_pln")
-'''
-
-    # Fetch and aggregate energy_hourly
-    energy_daily = {}
+    client = InfluxDBClient3(host=INFLUX_HOST, token=INFLUX_TOKEN,
+                             database=INFLUX_DATABASE, org=INFLUX_ORG)
     try:
-        raw = query_api.query_data_frame(energy_query)
-        df_e = pd.concat(raw, ignore_index=True) if isinstance(raw, list) else raw
-        if not df_e.empty:
-            sums = df_e.groupby('measurement_type')['_value'].sum()
-            for mt in ['production', 'import', 'export', 'consumption']:
-                energy_daily[mt] = round(float(sums.get(mt, 0)) / 1000, 3)  # Wh -> kWh
-    except Exception as e:
-        print(f"Warning: energy_hourly fetch failed: {e}")
+        energy_hourly = fetch_silver(client, 'energy_hourly', day_start, day_end)
+        savings_hourly = fetch_silver(client, 'savings_hourly', day_start, day_end)
+        irradiation = fetch_silver(client, 'irradiation', day_start - IRRADIATION_CONTEXT,
+                                   day_end + IRRADIATION_CONTEXT)
+    finally:
+        client.close()
 
-    # Fetch and aggregate battery_simulation
-    battery_daily = {}
-    try:
-        raw = query_api.query_data_frame(battery_query)
-        df_b = pd.concat(raw, ignore_index=True) if isinstance(raw, list) else raw
-        if not df_b.empty:
-            maxes = df_b.groupby('measurement_type')['_value'].max()
-            battery_daily['import_simulated'] = round(float(maxes.get('import_simulated', 0)) / 1000, 3)
-            battery_daily['export_simulated'] = round(float(maxes.get('export_simulated', 0)) / 1000, 3)
-            battery_daily['daily_savings_pln'] = round(float(maxes.get('daily_savings_pln', 0)), 2)
-    except Exception as e:
-        print(f"Warning: battery_simulation fetch failed: {e}")
+    expected_hours = int((day_end - day_start) / pd.Timedelta(hours=1))
+    if len(energy_hourly) != expected_hours:
+        print(f"WARNING: energy_hourly has {len(energy_hourly)} of {expected_hours} hours for {date_label}.")
 
-    row = {
-        'date': date_label,
-        'production_kwh': energy_daily.get('production'),
-        'import_kwh': energy_daily.get('import'),
-        'export_kwh': energy_daily.get('export'),
-        'consumption_kwh': energy_daily.get('consumption'),
-        'import_simulated_kwh': battery_daily.get('import_simulated'),
-        'export_simulated_kwh': battery_daily.get('export_simulated'),
-        'daily_savings_pln': battery_daily.get('daily_savings_pln'),
-    }
+    row = {'date': date_label,
+           **(daily_energy(energy_hourly) if not energy_hourly.empty else dict.fromkeys(ENERGY_COLUMNS)),
+           'daily_savings_pln': daily_savings(savings_hourly),
+           'daily_irradiation': daily_irradiation(irradiation, day_start, day_end)}
 
     os.makedirs(os.path.dirname(os.path.abspath(CSV_PATH)), exist_ok=True)
-    df_row = pd.DataFrame([row])
-    file_exists = os.path.exists(CSV_PATH)
-    if file_exists:
-        df_existing = pd.read_csv(CSV_PATH)
-        if date_label in df_existing['date'].values:
-            print(f"Entry for {date_label} already exists. Skipping.")
-            client.close()
-            return
-    df_row.to_csv(CSV_PATH, mode='a', header=not file_exists, index=False)
-
+    file_exists = os.path.exists(CSV_PATH) and os.path.getsize(CSV_PATH) > 0
+    pd.DataFrame([row], columns=CSV_COLUMNS).to_csv(CSV_PATH, mode='a', header=not file_exists, index=False)
     print(f"Daily archive entry written for {date_label}: {row}")
-    client.close()
+
 
 if __name__ == "__main__":
     process_daily_archive()
