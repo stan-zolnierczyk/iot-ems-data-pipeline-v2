@@ -1,1 +1,2 @@
 date,production_kwh,import_kwh,export_kwh,consumption_kwh,battery_charge_kwh,battery_discharge_kwh,daily_savings_pln,daily_irradiation
+2026-11-17,2.73,35.75,0.0,38.48,0.33,1.01,2.73,5561
